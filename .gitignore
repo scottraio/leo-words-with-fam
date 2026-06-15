@@ -1,0 +1,15 @@
+.leo
+
+# Rust
+/target
+**/*.rs.bk
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Local data
+*.db
+*.db-shm
+*.db-wal
