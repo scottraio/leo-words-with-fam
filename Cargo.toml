@@ -1,26 +1,26 @@
 [package]
 name = "leo-words-with-fam"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2024"
 
-# This crate is an in-process leo package. It is built as a member of the leo
-# workspace via a symlink at ~/Leo/leo/packages/leo-words-with-fam, so the path
-# dependencies below resolve relative to that location (like every leo package).
+# This crate is an in-process leo package. It lives in this repo and is symlinked
+# into ~/Leo/leo/packages/leo-words-with-fam. It is consumed by leo as an
+# out-of-workspace path dependency (leo's root Cargo.toml excludes it from the
+# member glob), so all versions are pinned explicitly rather than inherited from
+# leo's workspace. The path dependencies below resolve via the symlink.
 
 [dependencies]
 leo-core = { path = "../../crates/leo-core" }
 leo-package = { path = "../../crates/leo-package" }
 leo-db = { path = "../../crates/leo-db" }
 leo-apns = { path = "../leo-apns" }
-async-trait.workspace = true
-anyhow.workspace = true
-thiserror.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-axum.workspace = true
-sqlx.workspace = true
-tokio.workspace = true
-tracing.workspace = true
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = { version = "0.8", features = ["ws"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
 rand = "0.8"
-
-[dev-dependencies]
