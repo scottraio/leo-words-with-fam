@@ -23,6 +23,13 @@ use crate::engine::Dictionary;
 
 pub struct WordsWithFamPlugin;
 
+/// Entry point for Leo's git-source package loader. `leo packages sync`
+/// generates a call to this for every `source = "git"` package, and the
+/// Settings "Add Package" flow requires it. Returns the package boxed.
+pub fn leo_register() -> Box<dyn LeoPackage> {
+    Box::new(WordsWithFamPlugin)
+}
+
 /// The push category used for turn/game notifications. Created on reload.
 const PUSH_CATEGORY: &str = "words_with_fam";
 
