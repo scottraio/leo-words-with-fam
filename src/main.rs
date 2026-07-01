@@ -44,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
         leo_api_url,
         dict,
     };
-    let app = api::router(state);
+    // Leo proxies /p/words-with-fam/<rest> here verbatim, and the frontend calls
+    // /p/words-with-fam/api/*, so mount the game router under /api.
+    let app = axum::Router::new().nest("/api", api::router(state));
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!("words-with-fam listening on 127.0.0.1:{port}");
