@@ -1,11 +1,40 @@
-//! Persistence for games and moves, stored in leo's SQLite database via the
-//! shared `DbPool`. Tables are created by the package's `migrations()`.
+//! Persistence for games and moves in the app's OWN SQLite database. Tables are
+//! created by [`MIGRATIONS`] at startup.
 
-use leo_core::helpers::{id, now};
-use leo_db::DbPool;
+use crate::helpers::{id, now};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::FromRow;
+use sqlx::{FromRow, SqlitePool as DbPool};
+
+/// Schema for the app's own SQLite (run at startup). Previously the package's
+/// `LeoPackage::migrations()`; now self-owned since the data lives in words.db.
+pub const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS wwf_games (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        state TEXT NOT NULL,
+        player_ids TEXT NOT NULL,
+        current_player_id TEXT NOT NULL,
+        winner_id TEXT,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT
+    )",
+    "CREATE TABLE IF NOT EXISTS wwf_moves (
+        id TEXT PRIMARY KEY,
+        game_id TEXT NOT NULL,
+        player_id TEXT NOT NULL,
+        move_no INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        placements TEXT NOT NULL DEFAULT '[]',
+        words TEXT NOT NULL DEFAULT '[]',
+        score INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_wwf_moves_game ON wwf_moves(game_id)",
+];
 
 /// A persisted game plus its serialized engine state. A few columns are carried
 /// for completeness even where the views recompute them from the engine.
@@ -191,10 +220,12 @@ pub async fn count_moves(pool: &DbPool, game_id: &str) -> Result<i64, sqlx::Erro
 }
 
 pub async fn list_moves(pool: &DbPool, game_id: &str) -> Result<Vec<MoveRecord>, sqlx::Error> {
+    // No users table in the app's own DB — player_name is filled from the Leo
+    // roster at the API layer. Return the id here as a placeholder.
     sqlx::query_as::<_, MoveRecord>(
-        "SELECT m.id, m.player_id, COALESCE(u.name, m.player_id) AS player_name,
+        "SELECT m.id, m.player_id, m.player_id AS player_name,
                 m.move_no, m.kind, m.words, m.score, m.created_at
-         FROM wwf_moves m LEFT JOIN users u ON u.id = m.player_id
+         FROM wwf_moves m
          WHERE m.game_id = ? ORDER BY m.move_no",
     )
     .bind(game_id)

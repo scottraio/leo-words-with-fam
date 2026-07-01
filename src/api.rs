@@ -1,8 +1,10 @@
-//! The package's HTTP API, mounted by leo at `/p/words-with-fam/api/*`.
+//! The game HTTP API. Leo proxies this at `/p/words-with-fam/api/*`.
 //!
-//! Identity comes from the caller's leo session token (so a player can only act
-//! as themselves). Persistence uses leo's shared DB; push notifications call
-//! `ApnsService` directly — no cross-process bridge.
+//! Identity comes from the `X-Leo-User-Id` header Leo's proxy injects (the
+//! broker resolved the caller's session — the app never sees or validates
+//! tokens for identity). The family roster (names/colors/avatars) is fetched
+//! from `$LEO_API_URL/api/users` using the forwarded Bearer token. Game data
+//! lives in the app's own SQLite. No leo-* crate dependencies.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,24 +14,21 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-use leo_apns::apns::ApnsService;
-use leo_db::DbPool;
-use rand::SeedableRng;
+use sqlx::SqlitePool;
 
 use crate::engine::game::MoveOutcome;
 use crate::engine::{Dictionary, GameEngine, Placement};
 use crate::store;
 use crate::view::{self, ColorMap, GameSummary, GameView};
 
-const PUSH_CATEGORY: &str = "words_with_fam";
-
 #[derive(Clone)]
 pub struct ApiState {
-    pub db: DbPool,
-    pub apns: Option<Arc<ApnsService>>,
+    pub db: SqlitePool,
+    /// Base URL of the Leo hub, for roster lookups (from `$LEO_API_URL`).
+    pub leo_api_url: String,
     pub dict: Arc<Dictionary>,
 }
 
@@ -82,7 +81,7 @@ impl From<crate::engine::game::GameError> for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-// ── auth + helpers ───────────────────────────────────────────────────────────
+// ── identity + roster (broker) ───────────────────────────────────────────────
 
 fn bearer(headers: &HeaderMap) -> Option<String> {
     headers
@@ -93,23 +92,66 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Resolve the acting leo user from the session token.
-async fn auth_user(state: &ApiState, headers: &HeaderMap) -> ApiResult<String> {
-    let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
-    let session = leo_db::sessions::get_session_by_token(&state.db, &token)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .ok_or(ApiError::Unauthorized)?;
-    Ok(session.user_id)
+/// The acting user, from the `X-Leo-User-Id` header Leo's proxy injects. The
+/// proxy already authenticated the caller and strips any client-supplied value,
+/// so this header is trusted.
+fn auth_user(headers: &HeaderMap) -> ApiResult<String> {
+    headers
+        .get("x-leo-user-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .ok_or(ApiError::Unauthorized)
 }
 
-/// Map of leo user id → color, for rendering player chips.
-async fn color_map(db: &DbPool) -> ColorMap {
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, color FROM users")
-        .fetch_all(db)
+fn ustr(u: &Value, k: &str) -> String {
+    u.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+fn uactive(u: &Value) -> bool {
+    match u.get("is_active") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        _ => true,
+    }
+}
+
+fn color_of(u: &Value) -> String {
+    let c = ustr(u, "color");
+    if c.is_empty() { "#34D399".to_string() } else { c }
+}
+
+/// Fetch the family roster from Leo (`GET $LEO_API_URL/api/users`) with the
+/// caller's forwarded token. Returns `[]` on any failure — the game degrades to
+/// showing ids rather than erroring.
+async fn fetch_roster(state: &ApiState, headers: &HeaderMap) -> Vec<Value> {
+    let Some(token) = bearer(headers) else {
+        return vec![];
+    };
+    let url = format!("{}/api/users", state.leo_api_url.trim_end_matches('/'));
+    match reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(token)
+        .send()
         .await
-        .unwrap_or_default();
-    rows.into_iter().collect()
+    {
+        Ok(r) if r.status().is_success() => r.json::<Vec<Value>>().await.unwrap_or_default(),
+        _ => vec![],
+    }
+}
+
+fn colors_from(roster: &[Value]) -> ColorMap {
+    roster
+        .iter()
+        .map(|u| (ustr(u, "id"), color_of(u)))
+        .collect()
+}
+
+fn names_from(roster: &[Value]) -> HashMap<String, (String, String)> {
+    roster
+        .iter()
+        .map(|u| (ustr(u, "id"), (ustr(u, "name"), color_of(u))))
+        .collect()
 }
 
 async fn load(state: &ApiState, id: &str) -> ApiResult<(store::GameRecord, GameEngine)> {
@@ -121,68 +163,30 @@ async fn load(state: &ApiState, id: &str) -> ApiResult<(store::GameRecord, GameE
     Ok((rec, engine))
 }
 
-// ── push ─────────────────────────────────────────────────────────────────────
+// ── push (v1: degraded) ───────────────────────────────────────────────────────
 
-/// After any move, nudge whoever's turn it now is; on game end, tell everyone.
-fn dispatch_push(state: &ApiState, game_name: String, engine: &GameEngine) {
-    let Some(apns) = state.apns.clone() else { return };
-    let db = state.db.clone();
-    let finished = engine.finished;
-    let current = engine.current_player_id().to_string();
-    let winner = engine.winner_id.clone();
-    let participants: Vec<(String, String)> =
-        engine.players.iter().map(|p| (p.id.clone(), p.name.clone())).collect();
-
-    tokio::spawn(async move {
-        if finished {
-            let winner_name = winner
-                .as_ref()
-                .and_then(|w| participants.iter().find(|(id, _)| id == w))
-                .map(|(_, n)| n.clone())
-                .unwrap_or_else(|| "Nobody".into());
-            for (uid, _) in &participants {
-                let _ = apns
-                    .send_to_user(
-                        &db,
-                        uid,
-                        PUSH_CATEGORY,
-                        &format!("Game over — {game_name}"),
-                        &format!("{winner_name} wins!"),
-                        None,
-                        None,
-                    )
-                    .await;
-            }
-        } else {
-            let _ = apns
-                .send_to_user(
-                    &db,
-                    &current,
-                    PUSH_CATEGORY,
-                    &format!("Your turn in {game_name}"),
-                    "Tap to play your move.",
-                    None,
-                    None,
-                )
-                .await;
-        }
-    });
-}
+/// Turn-change push is intentionally a no-op in the standalone build: notifying
+/// *another* player requires a brokered push endpoint (Leo's `/api/push/send`
+/// only self-notifies). Tracked as a follow-up; the game is fully playable
+/// without it.
+fn dispatch_push(_state: &ApiState, _game_name: String, _engine: &GameEngine) {}
 
 // ── players ──────────────────────────────────────────────────────────────────
 
-async fn list_players(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Value>> {
-    let _ = auth_user(&state, &headers).await?;
-    let rows: Vec<(String, String, String, String)> =
-        sqlx::query_as("SELECT id, name, color, avatar FROM users WHERE is_active = 1 ORDER BY name")
-            .fetch_all(&state.db)
-            .await?;
-    let players: Vec<Value> = rows
-        .into_iter()
-        .map(|(id, name, color, avatar)| json!({ "id": id, "name": name, "color": color, "avatar": avatar }))
+async fn list_players(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let _ = auth_user(&headers)?;
+    let roster = fetch_roster(&state, &headers).await;
+    let players: Vec<Value> = roster
+        .iter()
+        .filter(|u| uactive(u))
+        .map(|u| {
+            json!({
+                "id": ustr(u, "id"),
+                "name": ustr(u, "name"),
+                "color": color_of(u),
+                "avatar": ustr(u, "avatar"),
+            })
+        })
         .collect();
     Ok(Json(json!(players)))
 }
@@ -202,7 +206,7 @@ async fn create_game(
     headers: HeaderMap,
     Json(body): Json<CreateGame>,
 ) -> ApiResult<Json<GameView>> {
-    let me = auth_user(&state, &headers).await?;
+    let me = auth_user(&headers)?;
 
     let mut player_ids = vec![me.clone()];
     for o in body.opponent_ids {
@@ -214,13 +218,17 @@ async fn create_game(
         return Err(ApiError::BadRequest("pick at least one opponent".into()));
     }
 
-    // Resolve display names from leo's users.
+    // Resolve display names from the Leo roster.
+    let roster = fetch_roster(&state, &headers).await;
+    let names = names_from(&roster);
     let mut pairs = Vec::with_capacity(player_ids.len());
     for pid in &player_ids {
-        let user = leo_db::users::get_user(&state.db, pid)
-            .await?
-            .ok_or_else(|| ApiError::BadRequest(format!("unknown player: {pid}")))?;
-        pairs.push((user.id, user.name));
+        let name = names
+            .get(pid)
+            .map(|(n, _)| n.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| pid.clone());
+        pairs.push((pid.clone(), name));
     }
 
     let mut rng = rand::rngs::StdRng::from_entropy();
@@ -246,7 +254,7 @@ async fn create_game(
     let rec = store::get_game(&state.db, &gid)
         .await?
         .ok_or_else(|| ApiError::Internal("game vanished after insert".into()))?;
-    let colors = color_map(&state.db).await;
+    let colors = colors_from(&roster);
     Ok(Json(view::build_view(&rec, &engine, &colors, Some(&me))))
 }
 
@@ -254,8 +262,8 @@ async fn list_games(
     State(state): State<ApiState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Vec<GameSummary>>> {
-    let me = auth_user(&state, &headers).await?;
-    let colors = color_map(&state.db).await;
+    let me = auth_user(&headers)?;
+    let colors = colors_from(&fetch_roster(&state, &headers).await);
     let mut out = Vec::new();
     for rec in store::list_games_for_player(&state.db, &me).await? {
         if let Ok(engine) = GameEngine::from_snapshot(rec.state.clone()) {
@@ -270,9 +278,9 @@ async fn get_game(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<GameView>> {
-    let me = auth_user(&state, &headers).await?;
+    let me = auth_user(&headers)?;
     let (rec, engine) = load(&state, &id).await?;
-    let colors = color_map(&state.db).await;
+    let colors = colors_from(&fetch_roster(&state, &headers).await);
     Ok(Json(view::build_view(&rec, &engine, &colors, Some(&me))))
 }
 
@@ -285,8 +293,10 @@ struct MoveResponse {
     game: GameView,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish_move(
     state: &ApiState,
+    headers: &HeaderMap,
     rec: &store::GameRecord,
     engine: &GameEngine,
     actor: &str,
@@ -309,7 +319,7 @@ async fn finish_move(
     let move_no = store::count_moves(&state.db, &rec.id).await? + 1;
     store::insert_move(&state.db, &rec.id, actor, move_no, kind, &placements, &words, score).await?;
     dispatch_push(state, rec.name.clone(), engine);
-    let colors = color_map(&state.db).await;
+    let colors = colors_from(&fetch_roster(state, headers).await);
     let game = view::build_view(rec, engine, &colors, Some(actor));
     Ok(Json(MoveResponse { outcome, game }))
 }
@@ -325,14 +335,17 @@ async fn play(
     Path(id): Path<String>,
     Json(body): Json<PlayReq>,
 ) -> ApiResult<Json<MoveResponse>> {
-    let me = auth_user(&state, &headers).await?;
+    let me = auth_user(&headers)?;
     let (rec, mut engine) = load(&state, &id).await?;
     let mut rng = rand::rngs::StdRng::from_entropy();
     let outcome = engine.apply_play(&me, &body.placements, &state.dict, &mut rng)?;
     let placements = serde_json::to_value(&body.placements).unwrap_or(json!([]));
     let words = serde_json::to_value(&outcome.words).unwrap_or(json!([]));
     let score = outcome.score;
-    finish_move(&state, &rec, &engine, &me, "play", placements, words, score, Some(outcome)).await
+    finish_move(
+        &state, &headers, &rec, &engine, &me, "play", placements, words, score, Some(outcome),
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -346,11 +359,15 @@ async fn swap(
     Path(id): Path<String>,
     Json(body): Json<SwapReq>,
 ) -> ApiResult<Json<MoveResponse>> {
-    let me = auth_user(&state, &headers).await?;
+    let me = auth_user(&headers)?;
     let (rec, mut engine) = load(&state, &id).await?;
     let mut rng = rand::rngs::StdRng::from_entropy();
     engine.apply_swap(&me, &body.tiles, &mut rng)?;
-    finish_move(&state, &rec, &engine, &me, "swap", json!({ "count": body.tiles.len() }), json!([]), 0, None).await
+    finish_move(
+        &state, &headers, &rec, &engine, &me, "swap",
+        json!({ "count": body.tiles.len() }), json!([]), 0, None,
+    )
+    .await
 }
 
 async fn pass(
@@ -358,10 +375,10 @@ async fn pass(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<MoveResponse>> {
-    let me = auth_user(&state, &headers).await?;
+    let me = auth_user(&headers)?;
     let (rec, mut engine) = load(&state, &id).await?;
     engine.apply_pass(&me)?;
-    finish_move(&state, &rec, &engine, &me, "pass", json!([]), json!([]), 0, None).await
+    finish_move(&state, &headers, &rec, &engine, &me, "pass", json!([]), json!([]), 0, None).await
 }
 
 async fn resign(
@@ -369,27 +386,34 @@ async fn resign(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<MoveResponse>> {
-    let me = auth_user(&state, &headers).await?;
+    let me = auth_user(&headers)?;
     let (rec, mut engine) = load(&state, &id).await?;
     engine.apply_resign(&me)?;
-    finish_move(&state, &rec, &engine, &me, "resign", json!([]), json!([]), 0, None).await
+    finish_move(&state, &headers, &rec, &engine, &me, "resign", json!([]), json!([]), 0, None).await
 }
 
 async fn history(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let _ = store::get_game(&state.db, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound("game not found".into()))?;
+    let names = names_from(&fetch_roster(&state, &headers).await);
     let moves = store::list_moves(&state.db, &id).await?;
     let out: Vec<Value> = moves
         .into_iter()
         .map(|m| {
+            let player_name = names
+                .get(&m.player_id)
+                .map(|(n, _)| n.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| m.player_name.clone());
             json!({
                 "id": m.id,
                 "player_id": m.player_id,
-                "player_name": m.player_name,
+                "player_name": player_name,
                 "move_no": m.move_no,
                 "kind": m.kind,
                 "words": serde_json::from_str::<Value>(&m.words_json).unwrap_or(json!([])),
@@ -412,7 +436,7 @@ struct Agg {
     best_word_score: i32,
 }
 
-async fn leaderboard(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
+async fn leaderboard(State(state): State<ApiState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let mut agg: HashMap<String, Agg> = HashMap::new();
 
     for rec in store::list_finished_games(&state.db).await? {
@@ -427,30 +451,23 @@ async fn leaderboard(State(state): State<ApiState>) -> ApiResult<Json<Value>> {
             }
         }
         for m in store::list_moves(&state.db, &rec.id).await? {
-            if let Ok(words) = serde_json::from_str::<Value>(&m.words_json) {
-                if let Some(arr) = words.as_array() {
-                    for w in arr {
-                        let pts = w.get("points").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                        let text = w.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        let e = agg.entry(m.player_id.clone()).or_default();
-                        if pts > e.best_word_score {
-                            e.best_word_score = pts;
-                            e.best_word = text.to_string();
-                        }
+            if let Ok(words) = serde_json::from_str::<Value>(&m.words_json)
+                && let Some(arr) = words.as_array()
+            {
+                for w in arr {
+                    let pts = w.get("points").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                    let text = w.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let e = agg.entry(m.player_id.clone()).or_default();
+                    if pts > e.best_word_score {
+                        e.best_word_score = pts;
+                        e.best_word = text.to_string();
                     }
                 }
             }
         }
     }
 
-    let names: HashMap<String, (String, String)> = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT id, name, color FROM users",
-    )
-    .fetch_all(&state.db)
-    .await?
-    .into_iter()
-    .map(|(id, name, color)| (id, (name, color)))
-    .collect();
+    let names = names_from(&fetch_roster(&state, &headers).await);
 
     let mut out: Vec<Value> = agg
         .into_iter()
